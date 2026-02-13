@@ -11,59 +11,145 @@ Usage:
 import os
 import argparse
 
-try:
-    from langchain.llms import OpenAI
-    from langchain.agents import initialize_agent, AgentType
-    from langchain.tools import tool
-except Exception:
-    raise RuntimeError("Please install requirements from simple_langchain_agent/requirements.txt")
+from langchain.tools import tool
+
+OpenAI = None
 
 
-@tool
-def calculator(expression: str) -> str:
-    import ast, operator as op
-    operators = {
-        ast.Add: op.add,
-        ast.Sub: op.sub,
-        ast.Mult: op.mul,
-        ast.Div: op.truediv,
-        ast.Pow: op.pow,
-        ast.Mod: op.mod,
-        ast.USub: op.neg,
-    }
+def _wizard_lookup(query: str) -> str:
+    """Search the Wizard World API for the given query and return short results.
 
-    def _eval(node):
-        if isinstance(node, ast.Constant):
-            return node.value
-        if isinstance(node, ast.Num):
-            return node.n
-        if isinstance(node, ast.BinOp):
-            left = _eval(node.left)
-            right = _eval(node.right)
-            op_type = type(node.op)
-            if op_type in operators:
-                return operators[op_type](left, right)
-        if isinstance(node, ast.UnaryOp):
-            operand = _eval(node.operand)
-            op_type = type(node.op)
-            if op_type in operators:
-                return operators[op_type](operand)
-        raise ValueError("Unsupported expression")
+    The function queries a few common endpoints (`wizards`, `spells`, `houses`) by
+    name and returns the first matching items found. Returns an informative
+    message if nothing is found or on errors.
+    """
+    import requests
+    from urllib.parse import urlencode
 
-    try:
-        node = ast.parse(expression, mode="eval").body
-        return str(_eval(node))
-    except Exception as e:
-        return f"Error evaluating expression: {e}"
+    import json
+
+    base = "https://wizard-world-api.herokuapp.com"
+    # Limit to wizards only since we want potions/elixirs used by a wizard
+    endpoints = ["wizards"]
+    q = query.strip()
+    if not q:
+        return "Please provide a search query (e.g. a wizard or spell name)."
+
+    potions_list = []
+    for ep in endpoints:
+        try:
+            params = {"name": q}
+            url = f"{base}/{ep}?{urlencode(params)}"
+            resp = requests.get(url, timeout=8)
+            if resp.status_code != 200:
+                continue
+            data = resp.json()
+            if not data:
+                continue
+            # Limit to first 5 wizard results
+            for item in data[:5]:
+                name = item.get("name") or item.get("firstName") or str(item)
+                # Some wizard records include `elixirs` or `potions` fields.
+                potions = item.get("elixirs") or item.get("potions") or []
+                for p in potions:
+                    p_name = p.get("name") or p.get("title") or str(p)
+                    p_desc = p.get("effect") or p.get("description") or ""
+                    potions_list.append({
+                        "wizard": name,
+                        "potion_name": p_name,
+                        "potion_description": p_desc,
+                    })
+        except Exception as e:
+            # Include errors as entries so caller can inspect
+            potions_list.append({"error": f"Error querying {ep}: {e}"})
+    if not potions_list:
+        return json.dumps({"query": q, "potions": []})
+
+    return json.dumps({"query": q, "potions": potions_list}, ensure_ascii=False)
+
+
+# LangChain tool wrapper (kept as `wizard_lookup` for agent use)
+wizard_lookup = tool(_wizard_lookup)
 
 
 def build_agent():
-    if not os.environ.get("OPENAI_API_KEY"):
-        raise RuntimeError("Set OPENAI_API_KEY environment variable before running")
-    llm = OpenAI(temperature=0)
-    tools = [calculator]
-    agent = initialize_agent(tools, llm, agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION, verbose=False)
-    return agent
+    # Import LLMs and agent initializer lazily to allow module import without an
+    # available OpenAI model class (helps unit/smoke tests for tools).
+    global OpenAI
+    try:
+        from langchain.llms import OpenAI as _OpenAI  # older style
+        OpenAI = _OpenAI
+    except Exception:
+        try:
+            from langchain.chat_models import ChatOpenAI as _ChatOpenAI
+            OpenAI = _ChatOpenAI
+        except Exception:
+            try:
+                from langchain import OpenAI as _OpenAI_pkg
+                OpenAI = _OpenAI_pkg
+            except Exception:
+                OpenAI = None
+
+    # Prefer the older `initialize_agent` API if available; otherwise use
+    # `create_agent` which is used in more recent LangChain releases.
+    def _make_executor(fallback_agent):
+        import json
+
+        class Executor:
+            def __init__(self, fallback):
+                self.fallback = fallback
+
+            def run(self, query: str) -> str:
+                # First, call the wizard lookup tool directly and prefer its JSON output
+                try:
+                    tool_out = _wizard_lookup(query)
+                    # tool_out is a JSON string; try to parse and check 'potions'
+                    parsed = json.loads(tool_out)
+                    if parsed.get("potions"):
+                        # Return the raw JSON string so callers get structured data
+                        return tool_out
+                except Exception:
+                    # If the direct tool call fails or returns no potions, fall back
+                    pass
+
+                # Fall back to the LLM-based agent/graph
+                if hasattr(self.fallback, "run"):
+                    return self.fallback.run(query)
+                # Some agents expect a messages dict
+                if hasattr(self.fallback, "stream"):
+                    parts = []
+                    for chunk in self.fallback.stream({"messages": [{"role": "user", "content": query}]}, stream_mode="updates"):
+                        parts.append(str(chunk))
+                    return "".join(parts)
+                raise RuntimeError("Fallback agent has no runnable interface")
+
+        return Executor(fallback_agent)
+
+    try:
+        from langchain.agents import initialize_agent, AgentType
+
+        if OpenAI is None:
+            raise RuntimeError(
+                "No compatible OpenAI LLM class found in LangChain; ensure a supported langchain version is installed"
+            )
+
+        if not os.environ.get("OPENAI_API_KEY"):
+            raise RuntimeError("Set OPENAI_API_KEY environment variable before running")
+
+        llm = OpenAI(temperature=0)
+        tools = [wizard_lookup]
+        agent = initialize_agent(tools, llm, agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION, verbose=False)
+        return _make_executor(agent)
+    except Exception:
+        from langchain.agents import create_agent
+
+        if not os.environ.get("OPENAI_API_KEY"):
+            raise RuntimeError("Set OPENAI_API_KEY environment variable before running")
+
+        # create_agent accepts a model string like "openai:gpt-3.5-turbo"
+        graph = create_agent(model="openai:gpt-3.5-turbo", tools=[_wizard_lookup], system_prompt="You are a helpful assistant")
+
+        return _make_executor(graph)
 
 
 def main():
@@ -74,8 +160,18 @@ def main():
 
     agent = build_agent()
 
+    import json
+
+    def _print_maybe_json(text: str):
+        try:
+            parsed = json.loads(text)
+            # Pretty-print structured JSON
+            print(json.dumps(parsed, indent=2, ensure_ascii=False))
+        except Exception:
+            print(text)
+
     if args.query:
-        print(agent.run(args.query))
+        _print_maybe_json(agent.run(args.query))
     elif args.repl:
         print("Starting REPL. Empty line to quit.")
         while True:
@@ -86,7 +182,7 @@ def main():
                 break
             if not text:
                 break
-            print(agent.run(text))
+            _print_maybe_json(agent.run(text))
     else:
         parser.print_help()
 
